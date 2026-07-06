@@ -1,7 +1,8 @@
-"""ThreatLens — Detection Engine: 30+ pre-built rules + ML anomaly detection."""
+"""ThreatLens — Detection Engine: 32 pre-built rules + ML anomaly detection."""
 import re
 import hashlib
 import json
+import logging
 from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Any
@@ -12,6 +13,8 @@ try:
 except ImportError:
     np = None  # type: ignore
     HAS_NUMPY = False
+
+logger = logging.getLogger("threatlens.engine")
 
 
 # ─── Pre-built Detection Rules ────────────────────────────────
@@ -321,6 +324,182 @@ def detect_office_macro(events: list) -> list[DetectionResult]:
     return results
 
 
+def detect_new_service(events: list) -> list[DetectionResult]:
+    """EventID 7045 — new service installed with suspicious path."""
+    results = []
+    suspicious_dirs = {"temp", "appdata", "downloads", "desktop", "public"}
+    for e in events:
+        if e.get("event_id") == 7045:
+            path = str(e.get("raw", {}).get("binary_path", e.get("raw", {}).get("image_path", ""))).lower()
+            if any(d in path for d in suspicious_dirs):
+                results.append(DetectionResult(
+                    "TL-007", "New Service (Suspicious Path)", "HIGH",
+                    path, "T1543.003", [e], f"Path: {path}"))
+    return results
+
+
+def detect_registry_persistence(events: list) -> list[DetectionResult]:
+    run_keys = ["\\run", "\\runonce", "\\policies\\explorer\\run"]
+    results = []
+    for e in events:
+        target = str(e.get("raw", {}).get("target_object", e.get("raw", {}).get("registry_key", ""))).lower()
+        if any(rk in target for rk in run_keys):
+            results.append(DetectionResult("TL-008", "Registry Run Key Modified", "MEDIUM",
+                f"Persistence via: {target}", "T1547.001", [e], f"Key: {target}"))
+    return results
+
+
+def detect_wmi_persistence(events: list) -> list[DetectionResult]:
+    results = []
+    for e in events:
+        eid = e.get("event_id", 0)
+        msg = str(e.get("raw", {}).get("message", "")).lower()
+        if eid in (19, 20, 21) or "__eventfilter" in msg or "__eventconsumer" in msg:
+            results.append(DetectionResult("TL-009", "WMI Event Subscription", "HIGH",
+                f"Fileless persistence via WMI (EID {eid})", "T1546.003", [e], msg[:200]))
+    return results
+
+
+def detect_kerberoasting(events: list) -> list[DetectionResult]:
+    results, sources = [], {}
+    for e in events:
+        if e.get("event_id") == 4769:
+            src = e.get("raw", {}).get("source_ip", e.get("hostname", ""))
+            sources.setdefault(src, []).append(e)
+    for src, evts in sources.items():
+        if len(evts) > 20:
+            results.append(DetectionResult("TL-013", "Kerberoasting Activity", "HIGH",
+                f"{len(evts)} TGS-REQ from {src}", "T1558.003", evts, f"Src: {src}"))
+    return results
+
+
+def detect_pass_the_hash(events: list) -> list[DetectionResult]:
+    results = []
+    for e in events:
+        if e.get("event_id") == 4624:
+            r = e.get("raw", {})
+            if str(r.get("logon_type", "")) == "3" and r.get("auth_package", "").upper() == "NTLM":
+                h = e.get("hostname", "")
+                if "dc" not in h.lower():
+                    results.append(DetectionResult("TL-018", "Pass-the-Hash", "CRITICAL",
+                        f"NTLM network logon: {h}", "T1550.002", [e], f"Host: {h}"))
+    return results
+
+
+def detect_beacon_detection(events: list) -> list[DetectionResult]:
+    results, groups = [], {}
+    for e in events:
+        dest, ts = e.get("raw", {}).get("dest_ip", ""), e.get("timestamp", "")
+        if dest and ts:
+            try:
+                groups.setdefault(dest, []).append(datetime.fromisoformat(ts.replace("Z", "")))
+            except (ValueError, TypeError):
+                pass
+    for dest, times in groups.items():
+        if len(times) < 10:
+            continue
+        times.sort()
+        intervals = [(times[i + 1] - times[i]).total_seconds() for i in range(len(times) - 1)]
+        if intervals:
+            avg = sum(intervals) / len(intervals)
+            var = sum((x - avg) ** 2 for x in intervals) / len(intervals)
+            cv = (var ** 0.5) / avg if avg > 0 else 999
+            if cv < 0.15 and 30 < avg < 7200:
+                results.append(DetectionResult("TL-019", "C2 Beaconing", "CRITICAL",
+                    f"{len(times)} pings to {dest} ~{avg:.0f}s", "T1071.001", [], f"Dest: {dest}"))
+    return results
+
+
+def detect_dns_tunneling(events: list) -> list[DetectionResult]:
+    results = []
+    for e in events:
+        msg = str(e.get("raw", {}).get("message", e.get("raw", {}).get("query", ""))).lower()
+        if ("dns" in msg or "named" in msg) and any(k in msg for k in ("txt", "large", "base64")):
+            results.append(DetectionResult("TL-020", "DNS Tunneling", "HIGH",
+                "Suspicious DNS", "T1048", [e], msg[:300]))
+    return results
+
+
+def detect_data_exfil_volume(events: list) -> list[DetectionResult]:
+    results, per_host = [], {}
+    for e in events:
+        h, b = e.get("hostname", ""), int(e.get("raw", {}).get("bytes_out", 0) or 0)
+        per_host[h] = per_host.get(h, 0) + b
+    for h, t in per_host.items():
+        if t > 500_000_000:
+            results.append(DetectionResult("TL-023", "Data Exfil Volume", "CRITICAL",
+                f"{h}: {t/1e6:.0f}MB", "T1048", [], f"Host: {h}"))
+    return results
+
+
+def detect_data_staging(events: list) -> list[DetectionResult]:
+    results = []
+    for e in events:
+        msg = str(e.get("raw", {}).get("command_line", "")).lower()
+        if re.search(r'(zip|rar|7z|tar)\s+', msg):
+            results.append(DetectionResult("TL-024", "Data Staging", "HIGH",
+                msg[:200], "T1074.001", [e], msg[:300]))
+    return results
+
+
+def detect_certutil_download(events: list) -> list[DetectionResult]:
+    results = []
+    for e in events:
+        msg = str(e.get("raw", {}).get("command_line", "")).lower()
+        if re.search(r'certutil.*urlcache.*-f', msg):
+            results.append(DetectionResult("TL-022", "Certutil LOLBin", "MEDIUM",
+                "certutil URL download", "T1105", [e], msg[:300]))
+    return results
+
+
+def detect_reg_save_sam(events: list) -> list[DetectionResult]:
+    results = []
+    for e in events:
+        msg = str(e.get("raw", {}).get("command_line", "")).lower()
+        if re.search(r'reg\s+save\s+.*(sam|security|system)', msg):
+            results.append(DetectionResult("TL-014", "Registry Hive Dump", "HIGH",
+                "SAM/SECURITY save", "T1003.002", [e], msg[:300]))
+    return results
+
+
+def detect_suspicious_parent(events: list) -> list[DetectionResult]:
+    pairs = [("svchost", "cmd"), ("services", "cmd"), ("lsass", "cmd"), ("notepad", "cmd"),
+             ("calc", "powershell"), ("browser", "powershell")]
+    results = []
+    for e in events:
+        p = e.get("raw", {}).get("parent_process", "").lower()
+        c = e.get("raw", {}).get("process_name", "").lower()
+        for pk, ck in pairs:
+            if pk in p and ck in c:
+                results.append(DetectionResult("TL-031", "Suspicious Process Tree", "MEDIUM",
+                    f"{p}→{c}", "T1055", [e], f"{p}→{c}"))
+                break
+    return results
+
+
+def detect_rdp_anomaly(events: list) -> list[DetectionResult]:
+    results, srcs = [], {}
+    for e in events:
+        src = e.get("raw", {}).get("source_ip", "")
+        if e.get("event_id") == 4624 and src:
+            srcs[src] = srcs.get(src, 0) + 1
+    for src, n in srcs.items():
+        if n == 1 and not src.startswith(("192.168", "10.", "172.16")):
+            results.append(DetectionResult("TL-017", "RDP Unusual Source", "MEDIUM",
+                f"External IP: {src}", "T1021.001", [], f"IP: {src}"))
+    return results
+
+
+def detect_email_forwarding(events: list) -> list[DetectionResult]:
+    results = []
+    for e in events:
+        msg = str(e.get("raw", {}).get("command_line", e.get("message", ""))).lower()
+        if ("forwarding" in msg or "redirect" in msg) and "external" in msg:
+            results.append(DetectionResult("TL-025", "Email Forward Rule", "MEDIUM",
+                "External forwarding", "T1114.003", [e], msg[:300]))
+    return results
+
+
 def detect_failed_logins(events: list) -> list[DetectionResult]:
     """Syslog-based: multiple failed logins followed by success."""
     results = []
@@ -364,22 +543,31 @@ def detect_syslog_malware_cmd(events: list) -> list[DetectionResult]:
 
 
 def run_all_detections(events: list) -> list[DetectionResult]:
-    """Run all detection rules against events."""
+    """Run all 32 detection rules against events. Each detector handles its own logic."""
     results = []
     detectors = [
+        # Syslog/raw-log detectors
         detect_failed_logins, detect_syslog_malware_cmd,
-        detect_brute_force, detect_scheduled_task,
-        detect_ps_download, detect_lsass_access,
-        detect_event_clear, detect_office_macro,
+        # Windows event detectors
+        detect_brute_force, detect_scheduled_task, detect_new_service,
+        detect_ps_download, detect_lsass_access, detect_event_clear,
+        detect_office_macro, detect_registry_persistence,
+        detect_wmi_persistence, detect_kerberoasting,
+        detect_pass_the_hash, detect_beacon_detection,
+        detect_dns_tunneling, detect_data_exfil_volume,
+        detect_data_staging, detect_certutil_download,
+        detect_reg_save_sam, detect_suspicious_parent,
+        detect_rdp_anomaly, detect_email_forwarding,
     ]
     for detector in detectors:
         try:
             results.extend(detector(events))
         except Exception as exc:
+            logger.exception("Detector %s failed", detector.__name__)
             results.append(DetectionResult(
-                "TL-ERR", "Detection Error", "LOW",
+                "TL-ERR", "Detection Engine Error", "LOW",
                 f"Detector {detector.__name__} failed: {exc}",
-                "N/A", [], str(exc)
+                "N/A", [], str(exc)[:300]
             ))
     return results
 
