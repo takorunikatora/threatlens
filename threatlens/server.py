@@ -2,6 +2,7 @@
 import os
 import json
 import secrets
+import sqlite3
 import logging
 from pathlib import Path
 from functools import wraps
@@ -19,6 +20,7 @@ ALLOWED_LOG_DIRS = [
 ]
 API_KEY = os.environ.get("THREATLENS_API_KEY", "")
 CORS_ORIGINS = os.environ.get("THREATLENS_CORS", "http://localhost:5173,http://localhost:3000").split(",")
+DB_PATH = os.environ.get("THREATLENS_DB", str(Path.home() / ".config" / "threatlens" / "baselines.db"))
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app, origins=[o.strip() for o in CORS_ORIGINS if o.strip()])
@@ -49,6 +51,78 @@ def _validate_log_path(path: str) -> bool:
         if resolved.startswith(allowed_real + os.sep) or resolved == allowed_real:
             return True
     return False
+
+
+# ─── Persistence ─────────────────────────────────────────────
+
+def _get_db():
+    """Get a persistent per-thread DB connection, auto-creating schema."""
+    if "db" not in g:
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+        g.db.execute(
+            "CREATE TABLE IF NOT EXISTS baselines ("
+            "  entity TEXT NOT NULL,"
+            "  event_id INTEGER NOT NULL,"
+            "  count INTEGER DEFAULT 0,"
+            "  PRIMARY KEY (entity, event_id)"
+            ")"
+        )
+        g.db.execute(
+            "CREATE TABLE IF NOT EXISTS baseline_meta ("
+            "  entity TEXT PRIMARY KEY,"
+            "  total_events INTEGER DEFAULT 0,"
+            "  last_seen TEXT DEFAULT ''"
+            ")"
+        )
+        g.db.commit()
+    return g.db
+
+
+def _save_baseline(detector, entity_key):
+    """Persist AnomalyDetector baselines to SQLite."""
+    db = _get_db()
+    for entity, stats in detector.baselines.items():
+        db.execute(
+            "INSERT OR REPLACE INTO baseline_meta (entity, total_events, last_seen) VALUES (?, ?, ?)",
+            (entity, stats["total_events"], stats.get("last_seen", ""))
+        )
+        for eid, count in stats["event_ids"].items():
+            db.execute(
+                "INSERT OR REPLACE INTO baselines (entity, event_id, count) VALUES (?, ?, ?)",
+                (entity, int(eid), count)
+            )
+    db.commit()
+
+
+def _load_baseline(detector, entity: str):
+    """Load baseline for a single entity from SQLite into a detector."""
+    db = _get_db()
+    meta = db.execute(
+        "SELECT total_events, last_seen FROM baseline_meta WHERE entity = ?", (entity,)
+    ).fetchone()
+    if not meta:
+        return False
+    rows = db.execute(
+        "SELECT event_id, count FROM baselines WHERE entity = ?", (entity,)
+    ).fetchall()
+    detector.baselines[entity] = {
+        "total_events": meta["total_events"],
+        "event_ids": {row["event_id"]: row["count"] for row in rows},
+        "unique_event_types": len(rows),
+        "last_seen": meta["last_seen"],
+    }
+    return True
+
+
+def _teardown_db(exc=None):
+    db = g.pop("db", None)
+    if db:
+        db.close()
+
+
+app.teardown_appcontext(_teardown_db)
 
 
 # ─── API ─────────────────────────────────────────────────────
@@ -128,10 +202,10 @@ def baseline():
         return jsonify({"error": "Access denied — path outside allowed directories"}), 403
     try:
         evts = ingest_log_file(path)
-        # Per-request detector instance — no global state sharing
         det = AnomalyDetector()
         det.train_baseline(evts, entity_key)
-        return jsonify({"entities": len(det.baselines), "status": "baseline built"})
+        _save_baseline(det, entity_key)
+        return jsonify({"entities": len(det.baselines), "status": "baseline built and persisted"})
     except Exception as exc:
         logger.exception("Baseline build failed")
         return jsonify({"error": str(exc)}), 500
@@ -147,7 +221,8 @@ def score():
         return jsonify({"error": "entity required"}), 400
     try:
         det = AnomalyDetector()
-        det.baselines = {entity: {"total_events": 100, "event_ids": {}, "unique_event_types": 0, "last_seen": ""}}
+        if not _load_baseline(det, entity):
+            return jsonify({"error": f"No baseline for entity '{entity}' — train first via /api/baseline"}), 404
         s = det.score_entity(entity, recent)
         return jsonify({"entity": entity, "anomaly_score": s, "anomalous": s > 50})
     except Exception as exc:
@@ -167,6 +242,11 @@ def index():
 
 def main():
     port = int(os.environ.get("PORT", 5150))
+    if not API_KEY:
+        logger.warning(
+            "⚠️  THREATLENS_API_KEY not set — API is running WITHOUT authentication. "
+            "Set the environment variable to enable Bearer token auth on all endpoints."
+        )
     logger.info("ThreatLens v%s starting on port %d (auth=%s)", __version__, port, bool(API_KEY))
     app.run(host="0.0.0.0", port=port, debug=False)
 

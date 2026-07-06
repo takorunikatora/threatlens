@@ -500,6 +500,199 @@ def detect_email_forwarding(events: list) -> list[DetectionResult]:
     return results
 
 
+def detect_password_spray(events: list) -> list[DetectionResult]:
+    """TL-002: Same source IP attempting 1-2 passwords across many accounts."""
+    results = []
+    ip_users: dict[str, set] = defaultdict(set)
+    ip_ts: dict[str, list] = defaultdict(list)
+    for e in events:
+        if e.get("event_id") == 4625:
+            ip = e.get("raw", {}).get("source_ip", "")
+            user = e.get("raw", {}).get("target_user_name", "")
+            ts = e.get("timestamp", "")
+            if ip and user:
+                ip_users[ip].add(user)
+                try:
+                    ip_ts[ip].append(datetime.fromisoformat(ts.replace("Z", "")))
+                except (ValueError, TypeError):
+                    pass
+    for ip, users in ip_users.items():
+        if len(users) >= 20:
+            results.append(DetectionResult("TL-002", "Password Spray", "HIGH",
+                f"{len(users)} accounts from {ip}", "T1110.003", [], f"IP: {ip}, Users: {len(users)}"))
+    return results
+
+
+def detect_new_domain_admin(events: list) -> list[DetectionResult]:
+    """TL-003: EventID 4728/4732 — member added to Domain Admins."""
+    results = []
+    for e in events:
+        if e.get("event_id") in (4728, 4732):
+            raw = e.get("raw", {})
+            group = raw.get("group_name", raw.get("target_user_name", "")).lower()
+            user = raw.get("member_name", raw.get("subject_user_name", ""))
+            if "domain admins" in group or "administrators" in group:
+                results.append(DetectionResult("TL-003", "New Domain Admin", "CRITICAL",
+                    f"{user} added to {group}", "T1098", [e], f"User: {user}, Group: {group}"))
+    return results
+
+
+def detect_special_privileges(events: list) -> list[DetectionResult]:
+    """TL-004: EventID 4672 — special privileges assigned."""
+    results = []
+    target_privs = {"SeDebugPrivilege", "SeTakeOwnershipPrivilege", "SeBackupPrivilege",
+                    "SeRestorePrivilege", "SeTcbPrivilege"}
+    for e in events:
+        if e.get("event_id") == 4672:
+            privs = e.get("raw", {}).get("privileges", "")
+            user = e.get("raw", {}).get("subject_user_name", "")
+            matched = [p for p in target_privs if p in privs]
+            if matched:
+                results.append(DetectionResult("TL-004", "Special Privileges Assigned", "HIGH",
+                    f"{user}: {', '.join(matched)}", "T1078", [e], f"User: {user}, Privs: {matched}"))
+    return results
+
+
+def detect_uac_bypass(events: list) -> list[DetectionResult]:
+    """TL-005: Known UAC bypass patterns (fodhelper, computerdefaults, eventvwr)."""
+    results = []
+    bypass_kw = ("fodhelper.exe", "computerdefaults.exe", "eventvwr.exe",
+                 "sdclt.exe", "slui.exe", "winsat.exe", "wsreset.exe")
+    for e in events:
+        msg = str(e.get("raw", {}).get("command_line", "")).lower()
+        img = str(e.get("raw", {}).get("image", "")).lower()
+        combined = msg + " " + img
+        for kw in bypass_kw:
+            if kw in combined:
+                if "auto-elevate" in msg or not any(a in msg for a in ("setup", "install", "patch")):
+                    results.append(DetectionResult("TL-005", "UAC Bypass", "HIGH",
+                        f"Suspicious: {kw}", "T1548.002", [e], msg[:300]))
+                    break
+    return results
+
+
+def detect_ssh_key_added(events: list) -> list[DetectionResult]:
+    """TL-010: Modification to authorized_keys."""
+    results = []
+    for e in events:
+        msg = str(e.get("raw", {}).get("message", e.get("message", ""))).lower()
+        if re.search(r'(authorized_keys|\.ssh/).*(updated|added|modified|written|echo)', msg):
+            results.append(DetectionResult("TL-010", "SSH Key Added", "MEDIUM",
+                "authorized_keys modified", "T1098.004", [e], msg[:300]))
+    return results
+
+
+def detect_ntds_access(events: list) -> list[DetectionResult]:
+    """TL-012: Volume shadow copy created + NTDS.dit access."""
+    results = []
+    vss_found = False
+    for e in events:
+        msg = str(e.get("raw", {}).get("command_line", e.get("raw", {}).get("message", ""))).lower()
+        raw_msg = str(e.get("message", "")).lower()
+        combined = msg + " " + raw_msg
+        if re.search(r'vssadmin.*create shadow|wmic.*shadowcopy', combined):
+            vss_found = True
+        if "ntds.dit" in combined:
+            results.append(DetectionResult("TL-012", "NTDS.dit Access", "CRITICAL",
+                "Active Directory database accessed" + (" (VSS created)" if vss_found else ""),
+                "T1003.003", [e], combined[:300]))
+    return results
+
+
+def detect_psexec_lateral(events: list) -> list[DetectionResult]:
+    """TL-015: PsExec / SMB lateral movement (EventID 7045 with PSEXESVC, or admin$ share)."""
+    results = []
+    for e in events:
+        eid = e.get("event_id", 0)
+        msg = str(e.get("raw", {}).get("command_line", e.get("raw", {}).get("message", ""))).lower()
+        img = str(e.get("raw", {}).get("image", e.get("raw", {}).get("service_name", ""))).lower()
+        combined = msg + " " + img
+        if "psexesvc" in combined or "psexec" in combined:
+            results.append(DetectionResult("TL-015", "PsExec Lateral Movement", "CRITICAL",
+                "PsExec service or binary detected", "T1021.002", [e], combined[:300]))
+        elif eid == 5145 and "admin$" in str(e.get("raw", {}).get("share_name", "")).lower():
+            src = e.get("raw", {}).get("source_ip", "")
+            if src and not src.startswith(("192.168", "10.", "172.16")):
+                results.append(DetectionResult("TL-015", "SMB Lateral Movement", "CRITICAL",
+                    f"admin$ access from {src}", "T1021.002", [e], f"Source: {src}"))
+    return results
+
+
+def detect_wmi_remote(events: list) -> list[DetectionResult]:
+    """TL-016: WMI process creation on remote host."""
+    results = []
+    for e in events:
+        msg = str(e.get("raw", {}).get("command_line", e.get("raw", {}).get("message", ""))).lower()
+        if re.search(r'wmic.*/node:|invoke-wmimethod|winrm.*invoke', msg):
+            results.append(DetectionResult("TL-016", "WMI Remote Execution", "HIGH",
+                msg[:200], "T1047", [e], msg[:300]))
+    return results
+
+
+def detect_amsi_bypass(events: list) -> list[DetectionResult]:
+    """TL-027: PowerShell AMSI bypass patterns."""
+    results = []
+    patterns = [
+        r'amsiinitfailed', r'amsi\.dll.*patch', r'amsiutils',
+        r'amsiscanbuffer.*0x80070057', r'ref.*amsi', r'amsi_context',
+        r'\[Ref\]\.Assembly', r'amsi\.dll', r'b77a38'
+    ]
+    for e in events:
+        msg = str(e.get("raw", {}).get("command_line", e.get("raw", {}).get("message", ""))).lower()
+        for pat in patterns:
+            if re.search(pat, msg):
+                results.append(DetectionResult("TL-027", "AMSI Bypass Attempt", "MEDIUM",
+                    msg[:200], "T1562.001", [e], msg[:300]))
+                break
+    return results
+
+
+def detect_edr_stopped(events: list) -> list[DetectionResult]:
+    """TL-028: Security tool service stopped or disabled (EventID 7036/7040)."""
+    results = []
+    edr_services = ("windefend", "mssense", "sense", "csfalconservice", "sentinelagent",
+                    "cylancesvc", "carbonblack", "tanium", "crowdstrike", "symantec",
+                    "mcafee", "trend", "kaspersky", "eset", "sophos", "sentinelone")
+    for e in events:
+        if e.get("event_id") in (7036, 7040):
+            svc = str(e.get("raw", {}).get("service_name", e.get("raw", {}).get("param1", ""))).lower()
+            state = str(e.get("raw", {}).get("state", e.get("raw", {}).get("param2", ""))).lower()
+            if any(s in svc for s in edr_services) and ("stop" in state or "disable" in state):
+                results.append(DetectionResult("TL-028", "EDR Service Stopped", "CRITICAL",
+                    f"{svc} — {state}", "T1562.001", [e], f"Service: {svc}, State: {state}"))
+    return results
+
+
+def detect_timestomping(events: list) -> list[DetectionResult]:
+    """TL-029: File timestamps modified (EventID 2 with CreateTime mismatch)."""
+    results = []
+    for e in events:
+        if e.get("event_id") == 2:
+            raw = e.get("raw", {})
+            create = raw.get("creation_utc_time", "")
+            previous = raw.get("previous_creation_utc_time", "")
+            if previous and create != previous:
+                results.append(DetectionResult("TL-029", "Timestomping", "MEDIUM",
+                    f"CreateTime changed: {previous} → {create}",
+                    "T1070.006", [e], f"Old: {previous}, New: {create}"))
+    return results
+
+
+def detect_phishing_click(events: list) -> list[DetectionResult]:
+    """TL-032: DNS/HTTP to known phishing simulation or suspicious new domains."""
+    results = []
+    phishing_kw = ("phish", "login-verify", "account-secure", "password-reset",
+                   "credential", "portal-verify", "secure-signin", "verify-account")
+    for e in events:
+        msg = str(e.get("raw", {}).get("message", e.get("raw", {}).get("url", e.get("message", "")))).lower()
+        for kw in phishing_kw:
+            if kw in msg:
+                results.append(DetectionResult("TL-032", "Phishing Link Clicked", "LOW",
+                    msg[:200], "T1566", [e], msg[:300]))
+                break
+    return results
+
+
 def detect_failed_logins(events: list) -> list[DetectionResult]:
     """Syslog-based: multiple failed logins followed by success."""
     results = []
@@ -543,13 +736,13 @@ def detect_syslog_malware_cmd(events: list) -> list[DetectionResult]:
 
 
 def run_all_detections(events: list) -> list[DetectionResult]:
-    """Run all 32 detection rules against events. Each detector handles its own logic."""
+    """Run all 32 detection rules against events."""
     results = []
     detectors = [
-        # Syslog/raw-log detectors
         detect_failed_logins, detect_syslog_malware_cmd,
-        # Windows event detectors
-        detect_brute_force, detect_scheduled_task, detect_new_service,
+        detect_brute_force, detect_password_spray,
+        detect_new_domain_admin, detect_special_privileges,
+        detect_uac_bypass, detect_scheduled_task, detect_new_service,
         detect_ps_download, detect_lsass_access, detect_event_clear,
         detect_office_macro, detect_registry_persistence,
         detect_wmi_persistence, detect_kerberoasting,
@@ -558,6 +751,10 @@ def run_all_detections(events: list) -> list[DetectionResult]:
         detect_data_staging, detect_certutil_download,
         detect_reg_save_sam, detect_suspicious_parent,
         detect_rdp_anomaly, detect_email_forwarding,
+        detect_ssh_key_added, detect_ntds_access,
+        detect_psexec_lateral, detect_wmi_remote,
+        detect_amsi_bypass, detect_edr_stopped,
+        detect_timestomping, detect_phishing_click,
     ]
     for detector in detectors:
         try:
