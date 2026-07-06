@@ -105,7 +105,7 @@ class ThreatLensApp:
         self.btn_baseline.pack(side=tk.LEFT, padx=(0, 8))
         self.btn_export = self._btn(r2, "📄  Export Alerts", self._export, BORDER, 10)
         self.btn_export.pack(side=tk.LEFT, padx=(0, 8))
-        self._btn(r2, "⚙ Settings", self._open_settings, BORDER, 10, fg=JADE).pack(side=tk.RIGHT, padx=(0, 8))
+        self._btn(r2, "⚙ Settings", self._open_settings, "#2a1040", 10, fg=JADE).pack(side=tk.RIGHT, padx=(0, 8))
         self._btn(r2, "Clear", self._clear, BG_DEEP, 10, fg="#555").pack(side=tk.RIGHT)
 
         # Progress bar
