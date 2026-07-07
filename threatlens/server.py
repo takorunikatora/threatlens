@@ -22,6 +22,16 @@ API_KEY = os.environ.get("THREATLENS_API_KEY", "")
 CORS_ORIGINS = os.environ.get("THREATLENS_CORS", "http://localhost:5173,http://localhost:3000").split(",")
 DB_PATH = os.environ.get("THREATLENS_DB", str(Path.home() / ".config" / "threatlens" / "baselines.db"))
 
+# Also check config file (from GUI Settings)
+_config_path = Path.home() / ".config" / "threatlens" / "config.json"
+try:
+    _cfg = json.loads(_config_path.read_text())
+    if not API_KEY and _cfg.get("api_key"):
+        API_KEY = _cfg["api_key"]
+        os.environ["THREATLENS_API_KEY"] = API_KEY
+except (FileNotFoundError, json.JSONDecodeError):
+    pass
+
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app, origins=[o.strip() for o in CORS_ORIGINS if o.strip()])
 
